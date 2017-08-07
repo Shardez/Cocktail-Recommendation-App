@@ -1,0 +1,686 @@
+---
+title: "Cocktail Recommendation System"
+author: "by Denis Sharoukhov, PhD"
+date: "Aug 8, 2017"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+---
+<!--set global variables here. -->
+
+```{r setup, echo=FALSE, message = FALSE}
+
+knitr::opts_chunk$set(echo = TRUE, eval = TRUE, warnings = FALSE,
+                      message = FALSE)
+```
+
+
+\centerline{\includegraphics[height=3in]{Cocktail.JPG}}
+
+
+### Introduction   
+
+The idea behind this project was to build a prototype for cocktail recommendation app.
+The recommendation is made using normalized (by amount) cocktails ingredients and a list of user rated cocktails.
+Additionally, prototype is capable of unsupervised clustering using cocktails similarity matrix.
+
+The data was scraped from [thecocktaildb](http://www.thecocktaildb.com/) using JSON API. 
+
+
+List of libraries used in this project:
+```{r libraries}
+library(dplyr); library(tidyr); library(data.table)
+library(ggplot2); library(stringr); library(knitr); 
+library(jsonlite); library(broom); library(curl)
+```
+
+```{r wd,echo=FALSE}
+setwd("C:/Projects/Portfolio/Cocktails-Reccomendation-System")
+```
+
+
+-------------------------------------
+### Section A. Data Preparation
+
+### Data Scraping
+It always starts with collecting proper data before one can test his/her ideas or hypothesis. This project is not an exception so let's scrape the data we need from the web. Since we don't know the list of ids containing cocktail data, ids are called sequentially and every non-empty entry is added to the bottom of the dataframe. Through trial and error the id range for all cocktails in the database was determined to be within 10000 to 20000 range. 
+
+```{r Data_Scraping, echo=TRUE, eval=FALSE}
+
+database=data.frame()
+ for(i in 10000:20000) {
+  link="http://www.thecocktaildb.com/api/json/v1/1/lookup.php?i="
+   z=paste(link,i,sep="")
+   data=as.data.frame(fromJSON(z))
+   database=rbind(database,data)
+   print(i)
+ }
+
+
+# Save resulting dataframe in a csv file
+
+ fwrite(data_base, file = "database.csv")
+
+```
+
+### Data Cleaning
+Before we proceed to cleaning the data let's quickly explore structure of the scraped data.
+```{r Data_read_csv}
+# Read previously saved data, set blank spaces to NAs. 
+
+data_base<- read.csv("data/database.csv", header=T, 
+                     na.strings=c(""))
+# Remove rows numbers
+data_base<-data_base[,-1]
+
+# Display first 5 rows
+# head(data_base, n=5)
+
+str(data_base)
+```
+The columns are: drink's id, drink's name, category (beer based/cocktail/Soft drink), type of the drink (alcoholic/non-alcoholic), type of the glass to serve the drink in, preparation instructions, link to drink's image (if available), ingredients (up to 15 ingredients!), corresponding measures for each ingredient and the date of the last modification of the entry.
+
+Since we are going to use ingredients and their measures, let's keep only these columns, along with the cocktail's name. 
+
+```{r Data_drop_columns}
+
+db <- data_base %>%
+  select(cocktail.name=drinks.strDrink,
+         contains("Ingredient"),
+         contains("Measure"))
+
+#head(db,n=5)
+
+```
+
+
+### Dealing with NAs
+
+The data entries don't look quite homogeneous and most likely orignially were pulled from different sources. 
+Additionally, data contains varying symbols which cannot be seen in a regular Rstudio viewer, but can be extracted by calling cell directly (by its row and column). There are white spaces, double white spaces, tab indentation and new line symbols. Let's replace them with NAs.     
+
+
+```{r Data_replace_na}
+
+db[ db == "" ] <- NA  
+db[ db == " " ] <- NA
+db[ db == "   "]<- NA
+db[ db == "/t"] <- NA
+db[ db == "\n"] <- NA
+
+# Convert every column to character type
+db <- as.data.frame(lapply(db, as.character), stringsAsFactors=FALSE)
+
+# Replace NAs with zeros
+#db[is.na(db)]<-0
+
+#head(db,n=10)
+```
+
+### Long Format
+Now let's reshape the data into the long format which will have only 3 columns: "cocktail name", "ingredient" and "measure".
+For that we will first gather ingredients and their measures into two separate dataframes. And then recombine them into a single data set. 
+
+```{r Data_Tidy_gather}
+
+db_ing_tidy <- db %>%
+  select(cocktail.name, contains("Ingredient"))%>%
+   gather(ingredients_number, ingredient, - cocktail.name)%>%
+   arrange(desc(cocktail.name))
+
+head(db_ing_tidy, n=10)
+
+db_m_tidy <- db %>%
+  select(cocktail.name, contains("Measure"))%>%
+   gather(measure_number, amount, - cocktail.name)%>%
+   rename(cocktail=cocktail.name)%>%
+   arrange(desc(cocktail))
+
+  
+head(db_m_tidy, n=10) 
+
+
+
+```
+
+Since most of the cocktails don't have all 15 ingredients filled, there are going to be multiple rows with ingredient=NA. Additionally there might be repetitions in ingredients list for the same cocktail. So we are going to deal with both of these issues by first selecting distinct rows and then removing all rows containing NA in the ingredient column.
+
+```{r Data_Tidy_join}
+
+db_join<-bind_cols(db_ing_tidy,db_m_tidy)%>%
+   select(cocktail.name,ingredient,amount)
+
+# Keep distinct rows only. Remove rows where ingredient is NA. 
+
+db_tidy <- db_join %>%
+  distinct()%>%  
+  filter(!is.na(ingredient))%>%
+   filter(ingredient!="na")%>%
+   filter(ingredient!="NA")
+
+head(db_tidy,n=10)
+```
+
+Let's check if we have any NAs left in the dataframe.
+
+```{r Data_Missing_Measures_I}
+cat("cocktail name/", "NAs:", sum(is.na(db_tidy$cocktail.name)),"\n")
+cat("ingredient/", "NAs:", sum(is.na(db_tidy$ingredient)),"\n")
+cat("amount/", "NAs:", sum(is.na(db_tidy$amount)),"\n")
+```
+
+There are 901 occurrences of NAs in the amount column, which indicates ingredients without the measure. Let's create a list of the most frequent ingredients missing their measure to get an idea for the value to replace missing measures with.
+
+```{r Data_Missing_Measures_II}
+db_na<-db_tidy%>%
+  filter(is.na(amount))%>%
+  group_by(ingredient)%>%
+  summarise(N=n())%>%
+  arrange(desc(N))
+
+head(db_na,20)
+```
+
+In most cases it's ice (90), followed by carbonated water (64) and orange juice (41). Mostly the list consists of liquids, however there are some solid ingredients like nutmeg (32), cherry (21) and salt (14). Let's now get the most frequent measure to further estimate what the good approximation should be.
+
+```{r Data_Missin_Measures_III}
+db_amount_mean<-db_tidy%>%
+  group_by(amount)%>%
+  summarise(N=n())%>%
+  arrange(desc(N))
+
+head(db_amount_mean,10)
+```
+Most frequent measure is: 1 oz which is equal to 29.57 mL. So a reasonable estimate would be somewhere around 10 mL to both get enough liquid and don't ruin the drink with too much salt (when salt is used). Roughly taking into account salt's density of 2.16 g/cm3 it will be equal to 4.6g of salt which is a bit less than a size of a teaspoon. It still might be considered somewhat high, depending on the personal taste, but one needs a good supply of minerals when he or she drinks!
+
+
+```{r Data_Replace_Missing_Measures}
+db_tidy$amount[is.na(db_tidy$amount)]<-10
+
+```
+
+Next, there are probably not that many people, except professional mixologists, who will bother to make a cocktail containing more than 7 ingredients. So from our dataframe let's select cocktails composed of 7 ingredients or less.
+
+```{r Data_Limit_n_ingredients}
+db_rm<-db_tidy%>%
+  group_by(cocktail.name)%>%
+  summarise(N.ings=n())%>%
+  filter(N.ings>=7)
+
+head(db_rm,n=10)
+  
+list_rm<-db_rm$cocktail.name
+
+db_tidy<-db_tidy%>%
+  filter(!cocktail.name%in%list_rm)
+
+```
+Now we have cocktails only with 7 or less ingredients in our dataframe. I, however, saved the recipe of "1-900-F*K-MEUP" on my to-do list for, well... personal investigation.
+
+
+As the last step in data preparation let's trim all columns from whitespaces on both sides and convert everything to the lower case.
+
+```{r Data_trim_whitespaces, echo=FALSE}
+# Trim both sides from whitespaces (if any), convert everything to the lower case
+db_tidy <- as.data.frame(sapply(db_tidy, str_trim, side = "both"))
+db_tidy <- db_tidy%>%
+   mutate_each(funs(tolower))
+
+
+# Remove intermediate dataframes
+rm(list=setdiff(ls(), "db_tidy"))
+gc()
+```
+
+
+### Most Common Ingredients 
+
+Let's do a bit of data exploration and look for the most common ingredients.
+
+```{r EDA}
+
+db_top <- db_tidy %>%
+  group_by(ingredient) %>%
+  summarise(N = n()) %>%
+  arrange(desc(N))
+
+
+head(db_top,n=15)
+```
+
+Vodka is, without a doubt, the most popular ingredient used in cocktail making (present in 584 cocktails). It does actually make sense, since it does not have a very strong after-taste and packs a lot of alcohol per mL. 
+It's followed closely by one of my favorite liquors: gin (423).  
+3rd place is occupied by orange juice (360), which is a great way of balancing you daily vitamin C intake.
+And, as expected, good number of cocktails (272) has to be made with ice.
+
+
+### Units of Measure. Standardization 
+
+There are quite diverse units of measure in the amount column: ounces (oz), milliliters (mL), table spoons, teaspoons, jiggers, pints, e.t.c. Let's convert all of quantifiable units to mL. 
+
+First, let's separate every amount (for example: 4 oz) into its quantity (4) and its unit (oz). Since the quantity can be specified as something like: (2 - 3) let's split it into two possible measures 2 or 3, and use the first, usually the smaller one. To deal with complex measures like "1 and 1/2" we will first convert it to a formula expression "(1+1/2)" and then use parsing and evaluation function (parse, eval) to calculate the numeric value.
+
+```{r Data_Units_Split, message=FALSE, warning=FALSE}
+
+db_tidyz <- db_tidy %>%
+mutate(number=gsub("[^[:digit:],^[:punct:] ]", "", amount)) %>% 
+   
+# Trim both sides from whitespaces
+mutate(numbe=str_trim(number,side="both"))%>% 
+   
+#replace double and triple and so on whitspaces with single whitespace
+mutate(numb=gsub("\\s+"," ",numbe))%>% 
+   
+# Select all numbers that matching the following four patterns
+mutate(num=str_extract(numb,"[:digit:]+\\s+[:digit:]+[:punct:]+[:digit:]|[:digit:]+[:punct:]+[:digit:]+|[:digit:]+|[:digit:]+[:punct:]+[:digit:]+[:digit:]+|[:digit:]+[:punct:]+[:digit:]+[:punct:]+[:digit:]+"))%>% 
+
+# Replace all whitespaces with + sign
+mutate(nu=str_replace_all(num," ","+")) %>% 
+
+# Separate everything that has "-" into two columns
+separate(nu,c("nu","nuu"), sep="-") %>% 
+
+# Select text only (with white spaces)   
+mutate(unit=gsub("[[:digit:]|[:punct:]]","",amount))%>% 
+   
+# Trim both sides from whitespaces
+mutate(unit=str_trim(unit,side="both")) %>%
+   
+#replace double and triple and so on whitspaces with single whitespace
+mutate(unit=gsub("\\s+"," ",unit))
+
+head(db_tidyz,n=10)
+```
+
+In the next step we are going to convert all quantifiable units (oz, shots, jiggers, e.t.c) into mL using the proper conversion factor. There can be multiple spellings for the same unit, for example, teaspoon can be spelled as "teaspoon", "tsp" or even "ts p". So we have to catch them all!
+
+```{r Data_Units_convert_to_ml}
+# Select only cocktail name, ingredient, nu number and unit column
+db_tidyx <- db_tidyz %>%
+   select(cocktail.name,ingredient,nu,unit)
+
+# Replace units with proper conversion to mL
+db_tidyx <- db_tidyx %>%
+   mutate(unit=str_replace(unit,"ozjamaican","oz")) %>%
+   mutate(unit=str_replace(unit,"oz","29.5")) %>%
+   mutate(unit=str_replace(unit,"shot","29.5")) %>%
+   mutate(unit=str_replace(unit,"jigger","44.5")) %>%
+   mutate(unit=str_replace(unit,"cup","257")) %>%
+   mutate(unit=str_replace(unit,"tblsp","11.1")) %>%
+   mutate(unit=str_replace(unit,"tsp","3.7")) %>%
+   mutate(unit=str_replace(unit,"ts p","3.7")) %>%
+   mutate(unit=str_replace(unit,"teaspoon","3.7")) %>%
+   mutate(unit=str_replace(unit,"cl","10")) %>%
+   mutate(unit=str_replace(unit,"dl","100")) %>%
+   mutate(unit=str_replace(unit,"litre","1000")) %>%
+   mutate(unit=str_replace(unit,"liter","1000")) %>%
+   mutate(unit=str_replace(unit,"dash","0.9")) %>%
+   mutate(unit=str_replace(unit,"splash","3.7")) %>%
+   mutate(unit=str_replace(unit,"twist","15")) %>%
+   mutate(unit=str_replace(unit,"twistof","15")) %>%
+   mutate(unit=str_replace(unit,"can","355")) %>%
+   mutate(unit=str_replace(unit,"cube","12")) %>%
+   mutate(unit=str_replace(unit,"part","29.5")) %>%
+   mutate(unit=str_replace(unit,"pint","473")) %>%
+   mutate(unit=str_replace(unit,"glass","473")) %>%
+   mutate(unit=str_replace(unit,"bottles","473")) %>%
+   mutate(unit=str_replace(unit,"gal","3785")) 
+  
+
+# Check if missing something important like glass or a pint 
+# unique(db_tidyx$unit)
+
+```
+All quantifiable units were converted to mL. However there are still subjective units, like "handful" or a "splash", for them let's use previous estimate for the missing measure of 10 mL. 
+
+
+Everything is ready, so let's parse and evaluate measures and multiply with the unit conversion factor, which was added in the previous step.
+
+```{r Data_Units_conversion}
+
+
+db_tidyc<-db_tidyx %>%
+   # Select all numbers that matching the following patterns
+   mutate(unit=str_extract(unit,"[:digit:]+[:digit:]+[:punct:]+[:digit:]|[:digit:]+[:punct:]+[:digit:]+|[:digit:]+|[:digit:]+[:punct:]+[:digit:]+[:digit:]+"))%>%  
+   
+   # Convert unit column to numeric
+   mutate(unit=as.numeric(unit))%>%  
+   
+   # replace comma , with dot .
+   mutate(nu=gsub(",",".",nu)) %>%  
+   
+   # add left and right brackets for nu colum for proper parsing and evaluation
+   mutate(nu=sub("^", "(",nu)) %>%   
+   mutate(nu=sub("$", ")",nu)) 
+
+# set NAs to 10 mL
+db_tidyc[is.na(db_tidyc)]<-10
+      
+# parse and evaluate nu
+m2 <- sapply(db_tidyc$nu ,function(x) eval(parse(text=x)))
+
+# add m2 as a new column 
+db_tidyc$nup<-m2
+
+# compare nu and nup for sanity check 
+# head(db_tidyc,20)
+
+# multiply nup and conversion factor for the measure's unit
+db_tidyc<- db_tidyc %>%
+   mutate(measure=nup*unit)
+
+head(db_tidyc,10)
+
+#  Select cocktail name, ingridient and measure (now in mL)
+db_clean_tidy <- db_tidyc %>%
+   select(cocktail.name,ingredient,measure)
+
+#head(db_clean_tidy,n=20)
+
+# Save tidy and clean cocktails data
+# fwrite(db_clean_tidy,"Data/db_clean_tidy.csv")
+
+# Remove intermediate dataframes
+rm(db_tidyx,db_tidyc, db_tidyz)
+
+```
+
+
+
+### Section B. Cocktails Similarity
+
+We are going to use cocktails similarity, in terms of ingredient composition, and list of user-rated cocktails to recommend him/her a cocktail that he/she might like. For that, let's develop a methodology to compare two cocktails and quantify how similar they are.
+
+First we will represent every cocktail as a vector in a high dimensional space, transforming data from long to wide format, where every dimension (column) is a separate cocktail ingredient. 
+There are total of 452 possible ingredients, so if the cocktail contains a specific ingredient the value in the corresponding column will be set to the ingredient's amount (in mL), if it does not the value will be set to 0. 
+
+For example, Mad Scientist cocktail which is made from: Bailey's irish cream, blueberry schnapps, grenadine, and raspberry schnapps will have non-zero values only in these columns and 0s in all other columns (the rest of ingredients space). First column is used for the cocktail name.
+
+```{r Data_Spread }
+
+# Hadley's trick for the spread by adding unique identifiers:
+db_clean_tidy$row <- 1:nrow(db_clean_tidy)
+
+# Let's spread it!
+db_spread <- db_clean_tidy %>%
+   spread(ingredient, measure)
+
+# Remove the row column
+db_spread<- db_spread %>%
+   select(-row)
+
+# Replace any previously uncaught NAs with 0s
+db_spread[is.na(db_spread)]<-0
+
+# Group by cocktail name
+db_spread_comb <- db_spread %>%
+   group_by(cocktail.name) %>%
+   summarise_each(funs(sum))
+
+rm(db_spread)
+
+#fwrite(db_spread_comb,"Data/db_spreaded.csv")
+
+```
+
+Now let's normalize cocktail vectors (rows), so that a sum of the vector multiplied with itself will be equal 1.
+
+```{r Data_Spread_Normalization}
+
+# Noramlize cocktails(vectors) using type 2 normalization
+#db_spread_comb<-read.csv("Data/db_spreaded.csv")
+#db_spread_comb<-db_spread_comb[,-1]
+
+cocktail.name<-db_spread_comb$cocktail.name
+dtf <- db_spread_comb[,-1]
+dtf <- sapply(dtf, as.numeric)
+for(i in 1:nrow(dtf)){
+   dtf[i,]<-dtf[i,]/norm(dtf[i,],type="2")
+}
+
+# Recombine with the coctails names
+db_norm<-data.frame(cocktail.name,dtf)
+#colnames(db_norm)
+
+# Spread is ready and normalized! Let's save it!
+# fwrite(db_norm,"Data/db_spreaded_normalized.csv")
+
+```
+
+
+### Inner products
+
+As a next step in our methodology we are going to calculate inner products between cocktails, i.e we will multiply every cocktail vector with a transpose of every other vector. This operation will allow us to get an easy-to-interpret cross-similarity metric (0 - have nothing in common, 1 - identical) between cocktails in the database.
+
+```{r Inner_Products }
+#db_norm<-read.csv("Data/db_spreaded_normalized.csv")
+#db_norm<-db_norm[,-1]
+dtf<-db_norm[,-1]
+dtf[is.na(dtf)]<-0
+
+
+# Convert everything to numeric
+dtf <- sapply(dtf, as.numeric)
+
+# Calculate inner product
+x<-dtf
+y<-t(x)
+sumi<-x %*% y
+
+# Replace NAs (if any) with 0
+sumi[is.na(sumi)]<-0
+
+# Convert to dataframe set rows and columns names to the names of cocktails 
+sumidf<-as.data.frame(sumi)
+colnames(sumidf)<-db_norm$cocktail.name
+rownames(sumidf)<-colnames(sumidf)
+
+# Save as db_innerproduct_matrix.csv
+# fwrite(sumidf,"Data/db_innerproduct_matrix.csv")
+```
+
+### Inner products matrix. Exploration
+```{r Explore_Inner_Products_I}
+# Get histogram
+hist(sumi[sumi>=0.0001],main="Histogram of Inner Products (Similarities)",xlab="Inner Product (more than 0.0000001)")
+
+
+# Ratio of cocktails with moderate-low to high similarity
+length(sumi[sumi<0.75&sumi>0.3])/length(sumi[sumi<0.9999&sumi>=0.75])
+#
+length(sumi[sumi<0.3&sumi>0.0001])/length(sumi[sumi<0.9999&sumi>=0.3])
+
+```
+
+Majority of cocktails have nothing in common (inner product=0), however if we remove complete zeros (by selecting inner products of at least 0.0001 and above) the graph demonstrates exponential-like distribution with a slow decay. There are about 5 times more cocktails with moderate (0.3 to 0.75) than high similarity (0.75 to 0.9999). And only twice as less low to high (0.3 to 0.9999) comparing to very low (0.00001 to 0.3)  similarity cocktails. Which, in fact, is quite promising in terms of chances of finding a good recommendation.
+
+Let's do a quick test to estimate how well inner products work to gauge similarity between cocktails.
+Starting with margarita:
+```{r Explore_Inner_Products_II}
+
+# Choose Margarita
+x<-sumidf %>%
+   select(margarita)
+
+x<-x[order(-x$margarita), , drop = FALSE]
+
+head(x,n=7)
+
+
+```
+We see that our approach is capable of finding variations (very high similarity) of margarita recipe. It can also find somewhat moderately similar drinks, like headcrush which has tequila and salt too, but differs in other ingredients: tabasco sauce and whipped cream. Well, that does sound yummy!
+Let's now test for something more interesting, like White Russian.
+
+```{r Explore_Inner_Products_III}
+
+# Choose Margarita
+x<-sumidf %>%
+   select(`white russian`)
+
+x<-x[order(-x$'white russian'), , drop = FALSE]
+
+head(x,n=7)
+
+
+```
+All of these are quite similar in taste to White Russian. 
+You can notice that top 3 cocktails (not including white russian) have the same similarity metric, which suggests, that in our database they are essentially the same exact cocktail having multiple names. Which, in fact, is true for almond joy and foxy lady, but brown bomber has peanut liquor instead of amaretto. All of these 3 are related to white russian by high amount of light cream. 
+Orgasm has both vodka and light cream (no pun intended), but proportion of light cream is different.
+
+### K-means Clustering
+Let's explore hidden relationships between cocktails in the inner product matrix by clustering cocktails in separate categories.
+For that we will use unsupervised machine learning algorithm known as K-means, and determine most optimal number of clusters by plotting within sum of squares as function of number of clusters. 
+For an ideal case, within sum of squares is equal to 0, i.e points in each cluster are at exactly the same location in features space and total sum of squares is exactly equal to between (clusters) sum of squares. 
+This can, however, almost never happen in practice, except if one chooses number of clusters to be equal to the number of distinct elements (observations) in the data. Obviously this does not provide with any additional information - each element is in its own cluster, the same as in a single cluster case - when all elements are in the exactly same cluster.
+So to extract reliable information about internal patterns in the data one has to consider this trade-off, and be cautious about possibility of over/under-estimating number of clusters. 
+A reasanobale way to choose number of clusters is by finding an "elbow" on the graph (i.e a pivot point, indicating change of regime) when increase in number of clusters does not decrease within sum of squares that rapidly anymore. 
+
+
+```{r Kmeans_N_Clusters, eval=TRUE }
+# Function for within sum of squares plot (if it wasn't loaded previously)
+wssplot <- function(data, nc=15, seed=1234){
+               wss <- (nrow(data)-1)*sum(apply(data,2,var))
+               for (i in 2:nc){
+                    print(i)
+                    set.seed(seed)
+                    wss[i] <- sum(kmeans(data, centers=i,nstart=25, iter.max = 10)$withinss)}
+                plot(1:nc, wss, type="b", xlab="Number of Clusters",
+                     ylab="Within groups sum of squares")
+                }
+
+# Let's determine reasonable number of clusters using Within Sum of Squares
+wssplot(sumidf)
+```
+
+From the plot my best estimate for the "elbow" location lands at number of clusters = 6. Let's use it to do the actual clustering and get corresponding statistics.
+
+```{r Kmeans_Clustering}
+# Perform unsupervised kmeans clustering on inner products matrix for 5 clusters
+set.seed(1234)
+km.out.ip <- kmeans(sumidf, 6, nstart =25,iter.max=100)
+
+# Tidy the k-means results
+x.km<- tidy(km.out.ip)%>%
+   select(cluster,size,withinss)
+
+x.km
+```
+Most of the resulting clusters are comparable in terms of size and within (each cluster) sum of squares, except for the 5th cluster which apparently was used as a "dump" by K-means algorithm to group the remaining cocktails in a one big cluster. We can, of course, try to further split this big group into smaller chunks by increasing number of clusters but we risk grouping cocktails which might have not that much in common. 
+
+Let's take a quick look into clusters by finding most frequent ingredient in every cluster.
+
+```{r Clusters_Exploration}
+
+ip.x <-as.data.frame(km.out.ip$cluster)
+
+ip.x <-data.frame(cluster=ip.x$`km.out.ip$cluster`,cocktail.name=rownames(ip.x))%>%
+   arrange(cluster)
+
+head(ip.x,n=10)
+
+db_clust<-merge(db_clean_tidy,ip.x,by="cocktail.name")
+
+db_clust_top<-db_clust%>%
+   group_by(cluster,ingredient)%>%
+   summarise(N = n())%>%
+   filter(N==max(N))%>%
+   arrange(cluster,desc(N))
+
+head(db_clust_top,n=20)
+# Save the comparison 
+#fwrite(dc_clust_comp,"Data/clust_compare.csv")
+
+```
+As can be seen, overall, clusters are quite distinct in their most frequent ingredient, which means k-means did a decent job grouping cocktails together based on their inner products values.
+So if, as an extra feature for our app, we would ever need to group cocktails by an additional parameter, like overall flavor group or, maybe, the mood they create, unsupervised clustering can be used as a good starting point.
+
+### Section C. Reccomendation Algorithm
+Finally, let's use inner products matrix and generate ranked recommendation list using small sample of user ratings.
+There are 15 rated cocktails in user1.csv file each rated on a scale from 1 to 5 (cocktail shaped stars!). We will use rating as a weight:
+1 star = -1 (strongly dislike), 
+2 stars = -0.5 (prefer not to drink), 
+3 stars = 0.25 (drinkable), 
+4 stars = 0.75 (almost perfect), 
+5 stars = 1 (can drink it all day - all night!) 
+and calculate average "preferences" vector in the inner product space.
+To get the actual recommendations we will use k-d tree algorithm (FNN package) and find 50 nearest neighbors to this averaged vector of user preferences. 
+
+Let's start with loading list of rated cocktails and converting ratings into weights.
+```{r Lisf_of_preferences}
+library(FNN)
+library(dplyr)
+library(tidyr)
+
+# Load preferences
+user1<-read.csv("user1.csv", header = F)
+colnames(user1)<-c('cocktail','rating')
+user1<- mutate_each(user1, funs(tolower))
+
+
+# Getting weights instead of stars (1 star=-1 2stars=-0.5 3stars=0.25,4stars=0.75,5stars=1)
+replDF <- data.frame(
+  rating = unique(user1$rating),
+  weight = NA)
+
+replDF$weight[replDF$rating==5] <- 1
+replDF$weight[replDF$rating==4] <- 0.75
+replDF$weight[replDF$rating==3] <- 0.25
+replDF$weight[replDF$rating==2] <- -0.5
+replDF$weight[replDF$rating==1] <- -1
+
+user1_list <- merge(user1, replDF, 
+                  by = "rating")
+
+# Get cocktails ID numbers
+for (i in 1:nrow(user1_list)){
+   user1_list$cocktail.id[i]<-match(user1_list$cocktail[i],colnames(sumidf))
+}
+user1_list<-user1_list%>%
+   arrange(cocktail)
+head(user1_list,n=15)
+```
+
+Now we will pull inner product vectors for each cocktail in user rated list, mutuality them with appropriate weights and average the results to get a single "preferences" vector.
+```{r Preferences_Averaging}
+
+# Select user rated choices from inner product matrix
+user_list_raw<-sumidf[user1_list$cocktail.id,]
+
+# Give random ratings 
+user_ratings<-user1_list$weight
+
+# Apply ratings as weights to the user choices
+user_list<-user_list_raw*user_ratings
+
+# Set all 0 inner product values to NAs to do proper averaging 
+user_list[user_list==0]<-NA
+
+# Calculate an average (vector) of user preferences
+user_vector<-as.data.frame(t(colMeans(user_list, na.rm = TRUE)))
+
+# Set NAs to 0
+user_vector[is.na(user_vector)]<-0
+#colnames(user_vector)<-cocktail.name
+```
+
+As the last step we will search for 50 nearest neighbors of this averaged "preferences" vector using kd-tree algorithm.
+```{r Get Reccomendations}
+# Calculate 50 nearest neighborhs using kd_tree
+user_vector_knnx<-get.knnx(sumidf,user_vector,k=50,algorithm = "kd_tree")
+
+# Get the names of the suggestions and their distances
+
+user_recc <-colnames(sumidf)[user_vector_knnx$nn.index]
+user_recc_distances<-data.frame(user_recc,t(user_vector_knnx$nn.dist))
+
+user_recc
+
+# Save user reccomendations
+# fwrite(user_recc_distances,"user1_reccomendations.csv")
+
+```
+### Results
+As the outcome I got the ranked list of cocktail recommendations for me to try! I made and consumed the first 3 recommended cocktails (for the sake of science, of course!) and I should confirm they did hit the right spot both in terms of flavor and alcohol content. 
+There are, of course, a lot of things that can be improved, starting with migrating to the [Absolut Drinks Database](https://addb.absolutdrinks.com/docs/) API and ending with developing minimum viable product (Web, Iphone or Android app) to conduct tests and get real-user data to quantify algorithm's performance on the larger scale. But before that I have 47 cocktails on my list to rate. 
+So stay tuned for updates, and cheers! 
